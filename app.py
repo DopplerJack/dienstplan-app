@@ -5,14 +5,13 @@ import io
 import datetime
 
 st.set_page_config(page_title="Dialyse Dienstplan", layout="wide")
-st.title("🏥 Dienstplan-Generator: Dialyse (Pro-Version)")
-st.markdown("Laden Sie Ihre Excel-Datei hoch. Bitte stellen Sie sicher, dass sie zwei Tabellenblätter enthält: 'Dienstplan' und 'Sonderregeln'.")
+st.title("🏥 Dienstplan-Generator: Dialyse (Diagnose-Modus)")
+st.markdown("Laden Sie Ihre Excel-Datei hoch. Die KI erstellt den Plan auch bei Unterbesetzung und zeigt Engpässe an.")
 
 uploaded_file = st.file_uploader("Excel-Tabelle hochladen (.xlsx)", type=["xlsx"])
 
 if uploaded_file is not None:
     try:
-        # Beide Tabellenblätter einlesen
         df_haupt = pd.read_excel(uploaded_file, sheet_name=0)
         df_haupt.fillna("Leer", inplace=True)
         
@@ -26,7 +25,7 @@ if uploaded_file is not None:
         st.success("Tabelle und Sonderregeln erfolgreich eingelesen!")
         
         if st.button("Dienstplan jetzt berechnen"):
-            with st.spinner("Die KI berechnet nun Millionen von Kombinationen und optimiert die Samstage..."):
+            with st.spinner("Die KI jongliert nun mit dem Personal und sucht nach Engpässen..."):
                 
                 model = cp_model.CpModel()
                 
@@ -41,20 +40,26 @@ if uploaded_file is not None:
                         for s in schichten:
                             dienst_vars[(m, t_idx, s)] = model.NewBoolVar(f"{m}_{t_idx}_{s}")
                 
-                # --- HILFSFUNKTION FÜR DATUM ---
+                # --- 1. ROBUSTE WOCHENTAGS-ERKENNUNG ---
                 wochentage_idx = []
                 samstage_idx = []
-                for t_idx, tag_str in enumerate(tage):
-                    try:
-                        dt = pd.to_datetime(tag_str, format='%d.%m.%y')
-                        wt = dt.weekday()
-                    except:
-                        wt = t_idx % 7 
+                for t_idx, tag_val in enumerate(tage):
+                    # Check, ob Excel ein echtes Datumsobiekt oder Text übergeben hat
+                    if isinstance(tag_val, datetime.datetime):
+                        wt = tag_val.weekday()
+                    else:
+                        try:
+                            dt = pd.to_datetime(str(tag_val), dayfirst=True)
+                            wt = dt.weekday()
+                        except:
+                            # Notfall-Fallback
+                            wt = t_idx % 7 
+                            
                     wochentage_idx.append(wt)
-                    if wt == 5: # Samstag
+                    if wt == 5: 
                         samstage_idx.append(t_idx)
 
-                # --- 1. GRUNDREGELN & EXCEL-INPUT ---
+                # --- 2. GRUNDREGELN & EXCEL-INPUT ---
                 for m in mitarbeiter_liste:
                     for t_idx in range(num_tage):
                         model.AddExactlyOne([dienst_vars[(m, t_idx, s)] for s in schichten])
@@ -62,33 +67,45 @@ if uploaded_file is not None:
                 for index, row in df_haupt.iterrows():
                     m = row['Name']
                     for t_idx, tag in enumerate(tage):
-                        # NEU: Überspringe Sonntage komplett (ignorieren Excel-Einträge)
-                        if wochentage_idx[t_idx] == 6:
+                        if wochentage_idx[t_idx] == 6: # Sonntag ignorieren
                             continue
                             
                         eintrag = str(row[tag]).strip()
                         if eintrag != "Leer":
-                            if eintrag == "--":
+                            if eintrag == "F": 
                                 model.Add(dienst_vars[(m, t_idx, 'Frei')] == 1)
                             elif eintrag in schichten:
                                 model.Add(dienst_vars[(m, t_idx, eintrag)] == 1)
 
-                # --- 2. TÄGLICHER BEDARF ---
+                # --- 3. DAS ÜBERDRUCK-VENTIL (Flexible Bedarfsplanung) ---
+                straf_variablen = []
+                fehlende_D1_vars = {}
+                fehlende_V1_vars = {}
+                
                 for t_idx in range(num_tage):
                     wt = wochentage_idx[t_idx]
-                    if wt in [0, 1]: 
-                        model.Add(sum(dienst_vars[(m, t_idx, 'D1')] for m in mitarbeiter_liste) == 7)
-                        model.Add(sum(dienst_vars[(m, t_idx, 'V1')] for m in mitarbeiter_liste) == 1)
-                    elif wt in [2, 3, 4, 5]: 
-                        model.Add(sum(dienst_vars[(m, t_idx, 'D1')] for m in mitarbeiter_liste) == 7)
-                        model.Add(sum(dienst_vars[(m, t_idx, 'V1')] for m in mitarbeiter_liste) == 0)
-                    else: # Sonntag
+                    if wt == 6: # Sonntag bleibt leer
                         for m in mitarbeiter_liste:
                             model.Add(dienst_vars[(m, t_idx, 'Frei')] == 1)
+                        continue
+                        
+                    # Wir erlauben, dass Schichten unbesetzt bleiben, strafen das aber extrem hart ab (10.000 Punkte)
+                    fehlend_d1 = model.NewIntVar(0, 7, f'fehlend_D1_{t_idx}')
+                    fehlende_D1_vars[t_idx] = fehlend_d1
+                    straf_variablen.append(fehlend_d1 * 10000)
+                    
+                    if wt in [0, 1]: # Montag, Dienstag
+                        model.Add(sum(dienst_vars[(m, t_idx, 'D1')] for m in mitarbeiter_liste) + fehlend_d1 == 7)
+                        
+                        fehlend_v1 = model.NewIntVar(0, 1, f'fehlend_V1_{t_idx}')
+                        fehlende_V1_vars[t_idx] = fehlend_v1
+                        straf_variablen.append(fehlend_v1 * 10000)
+                        model.Add(sum(dienst_vars[(m, t_idx, 'V1')] for m in mitarbeiter_liste) + fehlend_v1 == 1)
+                    else: # Mittwoch bis Samstag
+                        model.Add(sum(dienst_vars[(m, t_idx, 'D1')] for m in mitarbeiter_liste) + fehlend_d1 == 7)
+                        model.Add(sum(dienst_vars[(m, t_idx, 'V1')] for m in mitarbeiter_liste) == 0)
 
-                # --- 3. FIXE GLOBALE REGELN ---
-                straf_variablen = [] # Hier sammeln wir Punkte für die weichen Regeln
-                
+                # --- 4. FIXE GLOBALE REGELN ---
                 for m in mitarbeiter_liste:
                     for t in range(num_tage - 3):
                         model.Add(sum(dienst_vars[(m, t+i, 'D1')] for i in range(4)) <= 3)
@@ -96,16 +113,13 @@ if uploaded_file is not None:
                     for t in range(num_tage - 6):
                         model.Add(sum(dienst_vars[(m, t+i, s)] for i in range(7) for s in ['D1', 'V1', 'SL', 'D7']) <= 4)
                         
-                    # NEU: Samstags-Logik (Maximal 3, aber der 3. wird stark bestraft)
                     if len(samstage_idx) > 0:
-                        model.Add(sum(dienst_vars[(m, t, 'D1')] for t in samstage_idx) <= 3) # Hartes Limit auf 3 erhöht
-                        
+                        model.Add(sum(dienst_vars[(m, t, 'D1')] for t in samstage_idx) <= 3) 
                         dritter_sat = model.NewBoolVar(f"DritterSat_{m}")
-                        # Wenn die Summe der Samstage 3 ist, muss dritter_sat = 1 sein
                         model.Add(sum(dienst_vars[(m, t, 'D1')] for t in samstage_idx) <= 2 + dritter_sat)
-                        straf_variablen.append(dritter_sat * 50) # Sehr hohe Strafe (50) für einen 3. Samstag
+                        straf_variablen.append(dritter_sat * 50) 
 
-                # --- 4. INDIVIDUELLE REGELN (Aus Blatt 2) ---
+                # --- 5. INDIVIDUELLE REGELN ---
                 wt_map = {"Montag": 0, "Dienstag": 1, "Mittwoch": 2, "Donnerstag": 3, "Freitag": 4, "Samstag": 5, "Sonntag": 6}
                 
                 for index, row in df_regeln.iterrows():
@@ -138,38 +152,58 @@ if uploaded_file is not None:
                             if t_idx > 0: 
                                 model.AddImplication(dienst_vars[(m, t_idx, 'D1')], dienst_vars[(m, t_idx-1, 'Frei')])
 
-                # --- 5. WEICHE REGELN & OPTIMIERUNG ---
+                # --- 6. WEICHE REGELN & OPTIMIERUNG ---
                 for m in mitarbeiter_liste:
-                    # Vermeide zwei Samstage am Stück (leichte Strafe)
                     for i in range(len(samstage_idx) - 1):
                         sat1 = samstage_idx[i]
                         sat2 = samstage_idx[i+1]
                         doppel_sat = model.NewBoolVar(f"DoppelSat_{m}_{sat1}")
                         model.Add(dienst_vars[(m, sat1, 'D1')] + dienst_vars[(m, sat2, 'D1')] == 2).OnlyEnforceIf(doppel_sat)
-                        straf_variablen.append(doppel_sat * 10) # Mittlere Strafe (10)
+                        straf_variablen.append(doppel_sat * 10) 
 
-                # KI soll die Strafpunkte minimieren
                 model.Minimize(sum(straf_variablen))
 
-                # --- 6. BERECHNUNG ---
+                # --- 7. BERECHNUNG ---
                 solver = cp_model.CpSolver()
                 solver.parameters.max_time_in_seconds = 60.0 
                 status = solver.Solve(model)
 
                 if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
-                    st.success("🎉 Plan erfolgreich berechnet und optimiert!")
                     
+                    # Diagnose-Auswertung
+                    warnungen = []
+                    for t_idx in fehlende_D1_vars:
+                        fehlt_d1 = solver.Value(fehlende_D1_vars[t_idx])
+                        if fehlt_d1 > 0:
+                            datum = tage[t_idx]
+                            if isinstance(datum, datetime.datetime):
+                                datum = datum.strftime('%d.%m.%Y')
+                            warnungen.append(f"⚠️ **{datum}**: Es fehlen **{fehlt_d1}** Mitarbeiter für den D1-Dienst.")
+                            
+                    for t_idx in fehlende_V1_vars:
+                        fehlt_v1 = solver.Value(fehlende_V1_vars[t_idx])
+                        if fehlt_v1 > 0:
+                            datum = tage[t_idx]
+                            if isinstance(datum, datetime.datetime):
+                                datum = datum.strftime('%d.%m.%Y')
+                            warnungen.append(f"⚠️ **{datum}**: Der V1-Dienst konnte nicht besetzt werden.")
+
+                    if len(warnungen) > 0:
+                        st.warning("Der Dienstplan wurde erstellt, aber es gibt personelle Engpässe! Die Station ist an folgenden Tagen unterbesetzt:")
+                        for w in warnungen:
+                            st.write(w)
+                    else:
+                        st.success("🎉 Plan erfolgreich berechnet! Die Station ist an allen Tagen zu 100 % besetzt.")
+
+                    # Ausgabe formatieren
                     ausgabe_df = df_haupt.copy()
                     for index, row in df_haupt.iterrows():
                         m = row['Name']
                         for t_idx, tag in enumerate(tage):
                             for s in schichten:
                                 if solver.Value(dienst_vars[(m, t_idx, s)]) == 1:
-                                    ausgabe_df.at[index, tag] = s if s != 'Frei' else '--'
+                                    ausgabe_df.at[index, tag] = s if s != 'Frei' else 'F'
                                     
-                            # Kosmetische Korrektur: In der fertigen Excel auch die herausgefilterten Sonntags-Urlaube wieder hübsch als 'U' etc. anzeigen, falls gewünscht.
-                            # Für die reine Dienstplanung bleiben wir bei den berechneten Werten.
-                    
                     st.dataframe(ausgabe_df.head(10))
                     
                     buffer = io.BytesIO()
@@ -178,6 +212,6 @@ if uploaded_file is not None:
                     
                     st.download_button(label="📥 Fertigen Dienstplan herunterladen", data=buffer.getvalue(), file_name="Dienstplan_Fertig.xlsx")
                 else:
-                    st.error("🚨 Keine Lösung gefunden! Zu viele Regeln oder Freiwünsche blockieren sich gegenseitig.")
+                    st.error("🚨 Kritischer Fehler! Die Mathematik widerspricht sich komplett. Prüfen Sie, ob Sie manuell zwei Regeln gebrochen haben (z.B. ein V1 bei jemandem eingetragen, der als Sonderregel 'Kein V1' hat).")
     except Exception as e:
         st.error(f"Ein Fehler ist aufgetreten: {e}")
