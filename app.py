@@ -44,7 +44,6 @@ if uploaded_file is not None:
                 wochentage_idx = []
                 samstage_idx = []
                 for t_idx, tag_val in enumerate(tage):
-                    # Check, ob Excel ein echtes Datumsobiekt oder Text übergeben hat
                     if isinstance(tag_val, datetime.datetime):
                         wt = tag_val.weekday()
                     else:
@@ -52,7 +51,6 @@ if uploaded_file is not None:
                             dt = pd.to_datetime(str(tag_val), dayfirst=True)
                             wt = dt.weekday()
                         except:
-                            # Notfall-Fallback
                             wt = t_idx % 7 
                             
                     wochentage_idx.append(wt)
@@ -60,6 +58,8 @@ if uploaded_file is not None:
                         samstage_idx.append(t_idx)
 
                 # --- 2. GRUNDREGELN & EXCEL-INPUT ---
+                feste_eintraege = {} # NEU: Das Erinnerungsvermögen für manuelle Einträge
+                
                 for m in mitarbeiter_liste:
                     for t_idx in range(num_tage):
                         model.AddExactlyOne([dienst_vars[(m, t_idx, s)] for s in schichten])
@@ -72,6 +72,7 @@ if uploaded_file is not None:
                             
                         eintrag = str(row[tag]).strip()
                         if eintrag != "Leer":
+                            feste_eintraege[(m, t_idx)] = eintrag # Eintrag im Gedächtnis speichern
                             if eintrag == "F": 
                                 model.Add(dienst_vars[(m, t_idx, 'Frei')] == 1)
                             elif eintrag in schichten:
@@ -89,19 +90,18 @@ if uploaded_file is not None:
                             model.Add(dienst_vars[(m, t_idx, 'Frei')] == 1)
                         continue
                         
-                    # Wir erlauben, dass Schichten unbesetzt bleiben, strafen das aber extrem hart ab (10.000 Punkte)
                     fehlend_d1 = model.NewIntVar(0, 7, f'fehlend_D1_{t_idx}')
                     fehlende_D1_vars[t_idx] = fehlend_d1
                     straf_variablen.append(fehlend_d1 * 10000)
                     
-                    if wt in [0, 1]: # Montag, Dienstag
+                    if wt in [0, 1]: 
                         model.Add(sum(dienst_vars[(m, t_idx, 'D1')] for m in mitarbeiter_liste) + fehlend_d1 == 7)
                         
                         fehlend_v1 = model.NewIntVar(0, 1, f'fehlend_V1_{t_idx}')
                         fehlende_V1_vars[t_idx] = fehlend_v1
                         straf_variablen.append(fehlend_v1 * 10000)
                         model.Add(sum(dienst_vars[(m, t_idx, 'V1')] for m in mitarbeiter_liste) + fehlend_v1 == 1)
-                    else: # Mittwoch bis Samstag
+                    else: 
                         model.Add(sum(dienst_vars[(m, t_idx, 'D1')] for m in mitarbeiter_liste) + fehlend_d1 == 7)
                         model.Add(sum(dienst_vars[(m, t_idx, 'V1')] for m in mitarbeiter_liste) == 0)
 
@@ -126,12 +126,15 @@ if uploaded_file is not None:
                     m = row['Name']
                     if m not in mitarbeiter_liste: continue
                     
+                    # ANPASSUNG: Fester freier Tag vs. manueller Excel-Eintrag
                     freier_tag_str = str(row.get('Fester freier Tag', '')).strip()
                     if freier_tag_str in wt_map:
                         ziel_wt = wt_map[freier_tag_str]
                         for t_idx in range(num_tage):
                             if wochentage_idx[t_idx] == ziel_wt:
-                                model.Add(dienst_vars[(m, t_idx, 'Frei')] == 1)
+                                # Die Regel zwingt nur zu "Frei", wenn Sie nicht manuell etwas eingetragen haben
+                                if (m, t_idx) not in feste_eintraege:
+                                    model.Add(dienst_vars[(m, t_idx, 'Frei')] == 1)
                                 
                     if str(row.get('Keine V1', '')).strip().lower() == 'ja':
                         for t_idx in range(num_tage):
@@ -170,7 +173,6 @@ if uploaded_file is not None:
 
                 if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
                     
-                    # Diagnose-Auswertung
                     warnungen = []
                     for t_idx in fehlende_D1_vars:
                         fehlt_d1 = solver.Value(fehlende_D1_vars[t_idx])
@@ -195,7 +197,6 @@ if uploaded_file is not None:
                     else:
                         st.success("🎉 Plan erfolgreich berechnet! Die Station ist an allen Tagen zu 100 % besetzt.")
 
-                    # Ausgabe formatieren
                     ausgabe_df = df_haupt.copy()
                     for index, row in df_haupt.iterrows():
                         m = row['Name']
@@ -212,6 +213,6 @@ if uploaded_file is not None:
                     
                     st.download_button(label="📥 Fertigen Dienstplan herunterladen", data=buffer.getvalue(), file_name="Dienstplan_Fertig.xlsx")
                 else:
-                    st.error("🚨 Kritischer Fehler! Die Mathematik widerspricht sich komplett. Prüfen Sie, ob Sie manuell zwei Regeln gebrochen haben (z.B. ein V1 bei jemandem eingetragen, der als Sonderregel 'Kein V1' hat).")
+                    st.error("🚨 Kritischer Fehler! Die Mathematik widerspricht sich komplett.")
     except Exception as e:
         st.error(f"Ein Fehler ist aufgetreten: {e}")
