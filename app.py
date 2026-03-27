@@ -54,7 +54,7 @@ if uploaded_file is not None:
                     if wt == 5: # Samstag
                         samstage_idx.append(t_idx)
 
-                # --- 1. GRUNDREGELN ---
+                # --- 1. GRUNDREGELN & EXCEL-INPUT ---
                 for m in mitarbeiter_liste:
                     for t_idx in range(num_tage):
                         model.AddExactlyOne([dienst_vars[(m, t_idx, s)] for s in schichten])
@@ -62,6 +62,10 @@ if uploaded_file is not None:
                 for index, row in df_haupt.iterrows():
                     m = row['Name']
                     for t_idx, tag in enumerate(tage):
+                        # NEU: Überspringe Sonntage komplett (ignorieren Excel-Einträge)
+                        if wochentage_idx[t_idx] == 6:
+                            continue
+                            
                         eintrag = str(row[tag]).strip()
                         if eintrag != "Leer":
                             if eintrag == "--":
@@ -78,11 +82,13 @@ if uploaded_file is not None:
                     elif wt in [2, 3, 4, 5]: 
                         model.Add(sum(dienst_vars[(m, t_idx, 'D1')] for m in mitarbeiter_liste) == 7)
                         model.Add(sum(dienst_vars[(m, t_idx, 'V1')] for m in mitarbeiter_liste) == 0)
-                    else: 
+                    else: # Sonntag
                         for m in mitarbeiter_liste:
                             model.Add(dienst_vars[(m, t_idx, 'Frei')] == 1)
 
-                # --- 3. NEUE FIXE GLOBALE REGELN ---
+                # --- 3. FIXE GLOBALE REGELN ---
+                straf_variablen = [] # Hier sammeln wir Punkte für die weichen Regeln
+                
                 for m in mitarbeiter_liste:
                     for t in range(num_tage - 3):
                         model.Add(sum(dienst_vars[(m, t+i, 'D1')] for i in range(4)) <= 3)
@@ -90,12 +96,17 @@ if uploaded_file is not None:
                     for t in range(num_tage - 6):
                         model.Add(sum(dienst_vars[(m, t+i, s)] for i in range(7) for s in ['D1', 'V1', 'SL', 'D7']) <= 4)
                         
+                    # NEU: Samstags-Logik (Maximal 3, aber der 3. wird stark bestraft)
                     if len(samstage_idx) > 0:
-                        model.Add(sum(dienst_vars[(m, t, 'D1')] for t in samstage_idx) <= 2)
+                        model.Add(sum(dienst_vars[(m, t, 'D1')] for t in samstage_idx) <= 3) # Hartes Limit auf 3 erhöht
+                        
+                        dritter_sat = model.NewBoolVar(f"DritterSat_{m}")
+                        # Wenn die Summe der Samstage 3 ist, muss dritter_sat = 1 sein
+                        model.Add(sum(dienst_vars[(m, t, 'D1')] for t in samstage_idx) <= 2 + dritter_sat)
+                        straf_variablen.append(dritter_sat * 50) # Sehr hohe Strafe (50) für einen 3. Samstag
 
                 # --- 4. INDIVIDUELLE REGELN (Aus Blatt 2) ---
                 wt_map = {"Montag": 0, "Dienstag": 1, "Mittwoch": 2, "Donnerstag": 3, "Freitag": 4, "Samstag": 5, "Sonntag": 6}
-                straf_variablen = []
                 
                 for index, row in df_regeln.iterrows():
                     m = row['Name']
@@ -116,7 +127,6 @@ if uploaded_file is not None:
                         for t_idx in range(num_tage - 1):
                             model.Add(dienst_vars[(m, t_idx, 'D1')] + dienst_vars[(m, t_idx+1, 'D1')] <= 1)
                             
-                    # KORRIGIERTER BEREICH: Nur 2er/3er Blöcke
                     if str(row.get('Nur 2er/3er D1-Blöcke', '')).strip().lower() == 'ja':
                         for t_idx in range(num_tage):
                             links = dienst_vars[(m, t_idx-1, 'D1')] if t_idx > 0 else 0
@@ -130,13 +140,15 @@ if uploaded_file is not None:
 
                 # --- 5. WEICHE REGELN & OPTIMIERUNG ---
                 for m in mitarbeiter_liste:
+                    # Vermeide zwei Samstage am Stück (leichte Strafe)
                     for i in range(len(samstage_idx) - 1):
                         sat1 = samstage_idx[i]
                         sat2 = samstage_idx[i+1]
                         doppel_sat = model.NewBoolVar(f"DoppelSat_{m}_{sat1}")
                         model.Add(dienst_vars[(m, sat1, 'D1')] + dienst_vars[(m, sat2, 'D1')] == 2).OnlyEnforceIf(doppel_sat)
-                        straf_variablen.append(doppel_sat * 10) 
+                        straf_variablen.append(doppel_sat * 10) # Mittlere Strafe (10)
 
+                # KI soll die Strafpunkte minimieren
                 model.Minimize(sum(straf_variablen))
 
                 # --- 6. BERECHNUNG ---
@@ -154,6 +166,9 @@ if uploaded_file is not None:
                             for s in schichten:
                                 if solver.Value(dienst_vars[(m, t_idx, s)]) == 1:
                                     ausgabe_df.at[index, tag] = s if s != 'Frei' else '--'
+                                    
+                            # Kosmetische Korrektur: In der fertigen Excel auch die herausgefilterten Sonntags-Urlaube wieder hübsch als 'U' etc. anzeigen, falls gewünscht.
+                            # Für die reine Dienstplanung bleiben wir bei den berechneten Werten.
                     
                     st.dataframe(ausgabe_df.head(10))
                     
