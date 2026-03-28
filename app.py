@@ -58,7 +58,7 @@ if uploaded_file is not None:
                         samstage_idx.append(t_idx)
 
                 # --- 2. GRUNDREGELN & EXCEL-INPUT ---
-                feste_eintraege = {} # NEU: Das Erinnerungsvermögen für manuelle Einträge
+                feste_eintraege = {} 
                 
                 for m in mitarbeiter_liste:
                     for t_idx in range(num_tage):
@@ -72,7 +72,7 @@ if uploaded_file is not None:
                             
                         eintrag = str(row[tag]).strip()
                         if eintrag != "Leer":
-                            feste_eintraege[(m, t_idx)] = eintrag # Eintrag im Gedächtnis speichern
+                            feste_eintraege[(m, t_idx)] = eintrag 
                             if eintrag == "F": 
                                 model.Add(dienst_vars[(m, t_idx, 'Frei')] == 1)
                             elif eintrag in schichten:
@@ -85,7 +85,7 @@ if uploaded_file is not None:
                 
                 for t_idx in range(num_tage):
                     wt = wochentage_idx[t_idx]
-                    if wt == 6: # Sonntag bleibt leer
+                    if wt == 6: 
                         for m in mitarbeiter_liste:
                             model.Add(dienst_vars[(m, t_idx, 'Frei')] == 1)
                         continue
@@ -107,12 +107,18 @@ if uploaded_file is not None:
 
                 # --- 4. FIXE GLOBALE REGELN ---
                 for m in mitarbeiter_liste:
+                    # Maximal 3x D1 am Stück
                     for t in range(num_tage - 3):
                         model.Add(sum(dienst_vars[(m, t+i, 'D1')] for i in range(4)) <= 3)
                         
+                    # Maximal 4 Dienste pro Woche
                     for t in range(num_tage - 6):
                         model.Add(sum(dienst_vars[(m, t+i, s)] for i in range(7) for s in ['D1', 'V1', 'SL', 'D7']) <= 4)
                         
+                    # NEU: Maximal 1 V1-Dienst pro Monat (Gerechte Verteilung)
+                    model.Add(sum(dienst_vars[(m, t, 'V1')] for t in range(num_tage)) <= 1)
+                        
+                    # Samstags-Limit
                     if len(samstage_idx) > 0:
                         model.Add(sum(dienst_vars[(m, t, 'D1')] for t in samstage_idx) <= 3) 
                         dritter_sat = model.NewBoolVar(f"DritterSat_{m}")
@@ -126,34 +132,64 @@ if uploaded_file is not None:
                     m = row['Name']
                     if m not in mitarbeiter_liste: continue
                     
-                    # ANPASSUNG: Fester freier Tag vs. manueller Excel-Eintrag
+                    # Fester freier Tag
                     freier_tag_str = str(row.get('Fester freier Tag', '')).strip()
                     if freier_tag_str in wt_map:
                         ziel_wt = wt_map[freier_tag_str]
                         for t_idx in range(num_tage):
                             if wochentage_idx[t_idx] == ziel_wt:
-                                # Die Regel zwingt nur zu "Frei", wenn Sie nicht manuell etwas eingetragen haben
                                 if (m, t_idx) not in feste_eintraege:
                                     model.Add(dienst_vars[(m, t_idx, 'Frei')] == 1)
                                 
+                    # Keine V1
                     if str(row.get('Keine V1', '')).strip().lower() == 'ja':
                         for t_idx in range(num_tage):
                             model.Add(dienst_vars[(m, t_idx, 'V1')] == 0)
+
+                    # NEU: Immer ein V1-Dienst
+                    if str(row.get('Immer ein V1-Dienst', '')).strip().lower() == 'ja':
+                        model.Add(sum(dienst_vars[(m, t_idx, 'V1')] for t_idx in range(num_tage)) == 1)
                             
+                    # Max 1 D1 am Stück
                     if str(row.get('Max 1 D1 am Stück', '')).strip().lower() == 'ja':
                         for t_idx in range(num_tage - 1):
                             model.Add(dienst_vars[(m, t_idx, 'D1')] + dienst_vars[(m, t_idx+1, 'D1')] <= 1)
-                            
-                    if str(row.get('Nur 2er/3er D1-Blöcke', '')).strip().lower() == 'ja':
-                        for t_idx in range(num_tage):
-                            links = dienst_vars[(m, t_idx-1, 'D1')] if t_idx > 0 else 0
-                            rechts = dienst_vars[(m, t_idx+1, 'D1')] if t_idx < num_tage - 1 else 0
-                            model.Add(links + rechts >= 1).OnlyEnforceIf(dienst_vars[(m, t_idx, 'D1')])
 
+                    # Freitag frei vor Samstag-D1
                     if str(row.get('Freitag frei vor Samstag-D1', '')).strip().lower() == 'ja':
                         for t_idx in samstage_idx:
                             if t_idx > 0: 
                                 model.AddImplication(dienst_vars[(m, t_idx, 'D1')], dienst_vars[(m, t_idx-1, 'Frei')])
+
+                    # NEU: Keine Samstag/Montag Konstellation
+                    if str(row.get('Keine Samstag/Montag Konstellation', '')).strip().lower() == 'ja':
+                        for t_idx in samstage_idx:
+                            if t_idx + 2 < num_tage: 
+                                # Wenn am Samstag gearbeitet wird (D1), ist der Montag zwingend frei
+                                model.AddImplication(dienst_vars[(m, t_idx, 'D1')], dienst_vars[(m, t_idx+2, 'Frei')])
+
+                    # NEU: Bevorzuge 2er D1-Blöcke (Straft einzelne D1 und 3er-Blöcke ab)
+                    if str(row.get('Bevorzuge 2er D1-Blöcke', '')).strip().lower() == 'ja':
+                        for t_idx in range(num_tage):
+                            d_heute = dienst_vars[(m, t_idx, 'D1')]
+                            d_gestern = dienst_vars[(m, t_idx-1, 'D1')] if t_idx > 0 else 0
+                            d_morgen = dienst_vars[(m, t_idx+1, 'D1')] if t_idx < num_tage - 1 else 0
+                            
+                            # Bestrafe isolierte Schichten
+                            val_iso = model.NewIntVar(-2, 1, f"iso_{m}_{t_idx}")
+                            model.Add(val_iso == d_heute - d_gestern - d_morgen)
+                            is_iso = model.NewBoolVar(f"is_iso_bool_{m}_{t_idx}")
+                            model.Add(val_iso == 1).OnlyEnforceIf(is_iso)
+                            model.Add(val_iso != 1).OnlyEnforceIf(is_iso.Not())
+                            straf_variablen.append(is_iso * 15)
+                            
+                            # Bestrafe 3er-Blöcke
+                            val_3 = model.NewIntVar(0, 3, f"3blk_{m}_{t_idx}")
+                            model.Add(val_3 == d_gestern + d_heute + d_morgen)
+                            is_3blk = model.NewBoolVar(f"is_3blk_bool_{m}_{t_idx}")
+                            model.Add(val_3 == 3).OnlyEnforceIf(is_3blk)
+                            model.Add(val_3 != 3).OnlyEnforceIf(is_3blk.Not())
+                            straf_variablen.append(is_3blk * 10)
 
                 # --- 6. WEICHE REGELN & OPTIMIERUNG ---
                 for m in mitarbeiter_liste:
