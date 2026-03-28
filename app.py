@@ -201,4 +201,210 @@ if uploaded_file is not None:
                     if str(row.get('Immer ein V1-Dienst', '')).strip().lower() == 'ja':
                         model.Add(sum(dienst_vars[(m, t_idx, 'V1')] for t_idx in range(num_tage)) == 1)
                             
-                    if str(row.get('Max 1 D1 am Stück', '')).strip().lower
+                    if str(row.get('Max 1 D1 am Stück', '')).strip().lower() == 'ja':
+                        for t_idx in range(num_tage - 1):
+                            model.Add(dienst_vars[(m, t_idx, 'D1')] + dienst_vars[(m, t_idx+1, 'D1')] <= 1)
+
+                    if str(row.get('Freitag frei vor Samstag-D1', '')).strip().lower() == 'ja':
+                        for t_idx in samstage_idx:
+                            if t_idx > 0: 
+                                model.AddImplication(dienst_vars[(m, t_idx, 'D1')], dienst_vars[(m, t_idx-1, 'Frei')])
+
+                    if str(row.get('Keine Samstag/Montag Konstellation', '')).strip().lower() == 'ja':
+                        for t_idx in samstage_idx:
+                            if t_idx + 2 < num_tage: 
+                                model.AddImplication(dienst_vars[(m, t_idx, 'D1')], dienst_vars[(m, t_idx+2, 'Frei')])
+
+                    if str(row.get('Bevorzuge 2er D1-Blöcke', '')).strip().lower() == 'ja':
+                        for t_idx in range(num_tage):
+                            d_heute = dienst_vars[(m, t_idx, 'D1')]
+                            d_gestern = dienst_vars[(m, t_idx-1, 'D1')] if t_idx > 0 else 0
+                            d_morgen = dienst_vars[(m, t_idx+1, 'D1')] if t_idx < num_tage - 1 else 0
+                            
+                            val_iso = model.NewIntVar(-2, 1, f"iso_{m}_{t_idx}")
+                            model.Add(val_iso == d_heute - d_gestern - d_morgen)
+                            is_iso = model.NewBoolVar(f"is_iso_bool_{m}_{t_idx}")
+                            model.Add(val_iso == 1).OnlyEnforceIf(is_iso)
+                            model.Add(val_iso != 1).OnlyEnforceIf(is_iso.Not())
+                            straf_variablen.append(is_iso * 15000)
+                            
+                            val_3 = model.NewIntVar(0, 3, f"3blk_{m}_{t_idx}")
+                            model.Add(val_3 == d_gestern + d_heute + d_morgen)
+                            is_3blk = model.NewBoolVar(f"is_3blk_bool_{m}_{t_idx}")
+                            model.Add(val_3 == 3).OnlyEnforceIf(is_3blk)
+                            model.Add(val_3 != 3).OnlyEnforceIf(is_3blk.Not())
+                            straf_variablen.append(is_3blk * 10000)
+
+                    # NEU: Bevorzuge 3er D1-Blöcke
+                    if str(row.get('Bevorzuge 3er D1-Blöcke', '')).strip().lower() == 'ja':
+                        for t_idx in range(num_tage):
+                            d_heute = dienst_vars[(m, t_idx, 'D1')]
+                            d_gestern = dienst_vars[(m, t_idx-1, 'D1')] if t_idx > 0 else 0
+                            d_morgen = dienst_vars[(m, t_idx+1, 'D1')] if t_idx < num_tage - 1 else 0
+                            
+                            # Bestraft einzelne, isolierte Dienste
+                            val_iso = model.NewIntVar(-2, 1, f"iso3_{m}_{t_idx}")
+                            model.Add(val_iso == d_heute - d_gestern - d_morgen)
+                            is_iso = model.NewBoolVar(f"is_iso3_bool_{m}_{t_idx}")
+                            model.Add(val_iso == 1).OnlyEnforceIf(is_iso)
+                            model.Add(val_iso != 1).OnlyEnforceIf(is_iso.Not())
+                            straf_variablen.append(is_iso * 15000)
+                            
+                        for t_idx in range(num_tage - 1):
+                            d_heute = dienst_vars[(m, t_idx, 'D1')]
+                            d_morgen = dienst_vars[(m, t_idx+1, 'D1')]
+                            d_gestern = dienst_vars[(m, t_idx-1, 'D1')] if t_idx > 0 else 0
+                            d_uebermorgen = dienst_vars[(m, t_idx+2, 'D1')] if t_idx < num_tage - 2 else 0
+                            
+                            # Bestraft 2er-Blöcke
+                            val_2blk = model.NewIntVar(-2, 2, f"2blk_{m}_{t_idx}")
+                            model.Add(val_2blk == d_heute + d_morgen - d_gestern - d_uebermorgen)
+                            is_2blk = model.NewBoolVar(f"is_2blk_bool_{m}_{t_idx}")
+                            model.Add(val_2blk == 2).OnlyEnforceIf(is_2blk)
+                            model.Add(val_2blk != 2).OnlyEnforceIf(is_2blk.Not())
+                            straf_variablen.append(is_2blk * 10000)
+
+                # --- 6. WEICHE REGELN & OPTIMIERUNG ---
+                for m in mitarbeiter_liste:
+                    for i in range(len(samstage_idx) - 1):
+                        sat1 = samstage_idx[i]
+                        sat2 = samstage_idx[i+1]
+                        doppel_sat = model.NewBoolVar(f"DoppelSat_{m}_{sat1}")
+                        model.Add(dienst_vars[(m, sat1, 'D1')] + dienst_vars[(m, sat2, 'D1')] == 2).OnlyEnforceIf(doppel_sat)
+                        straf_variablen.append(doppel_sat * 10000) 
+
+                # --- 7. STUNDENKONTO & FAIRNESS ---
+                for m in mitarbeiter_liste:
+                    ausmass_int = ma_daten[m]['ausmass_int']
+                    soll_int = ma_daten[m]['soll_int']
+                    uebertrag_int = ma_daten[m]['uebertrag_int']
+                    tageswert_int = int(ausmass_int / 5.0) if ausmass_int > 0 else 0
+                    
+                    schicht_dauer_liste = []
+                    for t_idx in range(num_tage):
+                        schicht_dauer_liste.append(dienst_vars[(m, t_idx, 'D1')] * 1125)
+                        schicht_dauer_liste.append(dienst_vars[(m, t_idx, 'V1')] * 700)
+                        schicht_dauer_liste.append(dienst_vars[(m, t_idx, 'SL')] * 900)
+                        schicht_dauer_liste.append(dienst_vars[(m, t_idx, 'D7')] * 825)
+                        for abw in ['U', 'ZB', 'ÜZA', 'BA', 'FB']:
+                            schicht_dauer_liste.append(dienst_vars[(m, t_idx, abw)] * tageswert_int)
+                            
+                    plan_std_var = model.NewIntVar(0, 50000, f'plan_std_{m}')
+                    model.Add(plan_std_var == sum(schicht_dauer_liste))
+                    
+                    if soll_int > 0: 
+                        model.Add(plan_std_var >= soll_int - 2500)
+                        model.Add(plan_std_var <= soll_int + 2500)
+                    
+                    diff_var = model.NewIntVar(-50000, 50000, f'diff_{m}')
+                    model.Add(diff_var == plan_std_var + uebertrag_int - soll_int)
+                    
+                    abs_diff = model.NewIntVar(0, 50000, f'abs_diff_{m}')
+                    model.AddAbsEquality(abs_diff, diff_var)
+                    
+                    straf_variablen.append(abs_diff * 10)
+
+                model.Minimize(sum(straf_variablen))
+
+                # --- 8. BERECHNUNG & AUSGABE ---
+                solver = cp_model.CpSolver()
+                solver.parameters.max_time_in_seconds = 90.0 
+                status = solver.Solve(model)
+
+                if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
+                    
+                    warnungen = []
+                    for t_idx in fehlende_D1_vars:
+                        fehlt_d1 = solver.Value(fehlende_D1_vars[t_idx])
+                        if fehlt_d1 > 0:
+                            datum = tage[t_idx]
+                            if isinstance(datum, datetime.datetime):
+                                datum = datum.strftime('%d.%m.%Y')
+                            warnungen.append(f"⚠️ **{datum}**: Es fehlen **{fehlt_d1}** Mitarbeiter für den D1-Dienst.")
+                            
+                    for t_idx in fehlende_V1_vars:
+                        fehlt_v1 = solver.Value(fehlende_V1_vars[t_idx])
+                        if fehlt_v1 > 0:
+                            datum = tage[t_idx]
+                            if isinstance(datum, datetime.datetime):
+                                datum = datum.strftime('%d.%m.%Y')
+                            warnungen.append(f"⚠️ **{datum}**: Der V1-Dienst konnte nicht besetzt werden.")
+
+                    if len(warnungen) > 0:
+                        st.warning("Der Dienstplan wurde erstellt, aber es gibt personelle Engpässe! Die Station ist an folgenden Tagen unterbesetzt:")
+                        for w in warnungen:
+                            st.write(w)
+                    else:
+                        st.success("🎉 Plan erfolgreich berechnet! Die Stunden sind gerecht verteilt.")
+
+                    ausgabe_df = df_haupt.copy()
+
+                    plan_stunden_liste = []
+                    gesamt_stunden_liste = []
+
+                    for index, row in df_haupt.iterrows():
+                        m = row['Name']
+                        stundenausmass = parse_num(row.get('Stundenausmaß', 0))
+                        tageswert_abwesenheit = stundenausmass / 5.0
+                        plan_std_aktuell = 0.0
+                        
+                        for t_idx, tag in enumerate(tage):
+                            for s in schichten:
+                                if solver.Value(dienst_vars[(m, t_idx, s)]) == 1:
+                                    final_eintrag = s if s != 'Frei' else 'F'
+                                    ausgabe_df.at[index, tag] = final_eintrag
+                                    
+                                    if s == 'D1': plan_std_aktuell += 11.25
+                                    elif s == 'V1': plan_std_aktuell += 7.0
+                                    elif s == 'SL': plan_std_aktuell += 9.0
+                                    elif s == 'D7': plan_std_aktuell += 8.25
+                                    elif s in ['U', 'ZB', 'ÜZA', 'BA', 'FB']: plan_std_aktuell += tageswert_abwesenheit
+                        
+                        plan_stunden_liste.append(round(plan_std_aktuell, 2))
+                        uebertrag = parse_num(row.get('Übertrag Vormonat', 0))
+                        gesamt_stunden_liste.append(round(plan_std_aktuell + uebertrag, 2))
+
+                    if 'Übertrag Vormonat' in ausgabe_df.columns:
+                        col_idx = ausgabe_df.columns.get_loc('Übertrag Vormonat') + 1
+                    else:
+                        col_idx = 3 
+                        
+                    ausgabe_df.insert(col_idx, 'Plan-Stunden', plan_stunden_liste)
+                    ausgabe_df.insert(col_idx + 1, 'Stunden Gesamt', gesamt_stunden_liste)
+
+                    st.dataframe(ausgabe_df.head(10))
+                    
+                    buffer = io.BytesIO()
+                    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+                        ausgabe_df.to_excel(writer, index=False, sheet_name="Dienstplan")
+                        
+                        workbook = writer.book
+                        worksheet = writer.sheets['Dienstplan']
+                        
+                        fill_d1 = PatternFill(start_color="40E0D0", end_color="40E0D0", fill_type="solid")
+                        fill_v1 = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+                        fill_gruen = PatternFill(start_color="90EE90", end_color="90EE90", fill_type="solid")
+                        fill_rot = PatternFill(start_color="FF7F7F", end_color="FF7F7F", fill_type="solid")
+                        
+                        for row in worksheet.iter_rows(min_row=2): 
+                            for cell in row:
+                                val = str(cell.value).strip() if cell.value else ""
+                                if val == 'D1':
+                                    cell.fill = fill_d1
+                                elif val == 'V1':
+                                    cell.fill = fill_v1
+                                elif val in ['U', 'ZB', 'ÜZA', 'BA', 'FB']:
+                                    cell.fill = fill_gruen
+                                elif val == 'F':
+                                    cell.fill = fill_rot
+
+                    st.download_button(
+                        label="📥 Fertigen Dienstplan (inkl. Farben & Stunden) herunterladen", 
+                        data=buffer.getvalue(), 
+                        file_name="Dienstplan_Fertig_Farbig.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+                else:
+                    st.error("🚨 Kritischer Fehler! Die Mathematik widerspricht sich komplett.")
+    except Exception as e:
+        st.error(f"Ein Fehler ist aufgetreten: {e}")
