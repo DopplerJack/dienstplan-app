@@ -178,4 +178,80 @@ if uploaded_file is not None:
                         for t_idx in range(num_tage):
                             d_heute = dienst_vars[(m, t_idx, 'D1')]
                             d_gestern = dienst_vars[(m, t_idx-1, 'D1')] if t_idx > 0 else 0
-                            d_morgen = dienst_vars[(m, t_idx+1, 'D1')] if t_idx < num_tage - 1 else
+                            d_morgen = dienst_vars[(m, t_idx+1, 'D1')] if t_idx < num_tage - 1 else 0
+                            
+                            val_iso = model.NewIntVar(-2, 1, f"iso_{m}_{t_idx}")
+                            model.Add(val_iso == d_heute - d_gestern - d_morgen)
+                            is_iso = model.NewBoolVar(f"is_iso_bool_{m}_{t_idx}")
+                            model.Add(val_iso == 1).OnlyEnforceIf(is_iso)
+                            model.Add(val_iso != 1).OnlyEnforceIf(is_iso.Not())
+                            straf_variablen.append(is_iso * 15)
+                            
+                            val_3 = model.NewIntVar(0, 3, f"3blk_{m}_{t_idx}")
+                            model.Add(val_3 == d_gestern + d_heute + d_morgen)
+                            is_3blk = model.NewBoolVar(f"is_3blk_bool_{m}_{t_idx}")
+                            model.Add(val_3 == 3).OnlyEnforceIf(is_3blk)
+                            model.Add(val_3 != 3).OnlyEnforceIf(is_3blk.Not())
+                            straf_variablen.append(is_3blk * 10)
+
+                # --- 6. WEICHE REGELN & OPTIMIERUNG ---
+                for m in mitarbeiter_liste:
+                    for i in range(len(samstage_idx) - 1):
+                        sat1 = samstage_idx[i]
+                        sat2 = samstage_idx[i+1]
+                        doppel_sat = model.NewBoolVar(f"DoppelSat_{m}_{sat1}")
+                        model.Add(dienst_vars[(m, sat1, 'D1')] + dienst_vars[(m, sat2, 'D1')] == 2).OnlyEnforceIf(doppel_sat)
+                        straf_variablen.append(doppel_sat * 10) 
+
+                model.Minimize(sum(straf_variablen))
+
+                # --- 7. BERECHNUNG ---
+                solver = cp_model.CpSolver()
+                solver.parameters.max_time_in_seconds = 60.0 
+                status = solver.Solve(model)
+
+                if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
+                    
+                    warnungen = []
+                    for t_idx in fehlende_D1_vars:
+                        fehlt_d1 = solver.Value(fehlende_D1_vars[t_idx])
+                        if fehlt_d1 > 0:
+                            datum = tage[t_idx]
+                            if isinstance(datum, datetime.datetime):
+                                datum = datum.strftime('%d.%m.%Y')
+                            warnungen.append(f"⚠️ **{datum}**: Es fehlen **{fehlt_d1}** Mitarbeiter für den D1-Dienst.")
+                            
+                    for t_idx in fehlende_V1_vars:
+                        fehlt_v1 = solver.Value(fehlende_V1_vars[t_idx])
+                        if fehlt_v1 > 0:
+                            datum = tage[t_idx]
+                            if isinstance(datum, datetime.datetime):
+                                datum = datum.strftime('%d.%m.%Y')
+                            warnungen.append(f"⚠️ **{datum}**: Der V1-Dienst konnte nicht besetzt werden.")
+
+                    if len(warnungen) > 0:
+                        st.warning("Der Dienstplan wurde erstellt, aber es gibt personelle Engpässe! Die Station ist an folgenden Tagen unterbesetzt:")
+                        for w in warnungen:
+                            st.write(w)
+                    else:
+                        st.success("🎉 Plan erfolgreich berechnet! Die Station ist an allen Tagen zu 100 % besetzt.")
+
+                    ausgabe_df = df_haupt.copy()
+                    for index, row in df_haupt.iterrows():
+                        m = row['Name']
+                        for t_idx, tag in enumerate(tage):
+                            for s in schichten:
+                                if solver.Value(dienst_vars[(m, t_idx, s)]) == 1:
+                                    ausgabe_df.at[index, tag] = s if s != 'Frei' else 'F'
+                                    
+                    st.dataframe(ausgabe_df.head(10))
+                    
+                    buffer = io.BytesIO()
+                    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+                        ausgabe_df.to_excel(writer, index=False)
+                    
+                    st.download_button(label="📥 Fertigen Dienstplan herunterladen", data=buffer.getvalue(), file_name="Dienstplan_Fertig.xlsx")
+                else:
+                    st.error("🚨 Kritischer Fehler! Die Mathematik widerspricht sich komplett.")
+    except Exception as e:
+        st.error(f"Ein Fehler ist aufgetreten: {e}")
