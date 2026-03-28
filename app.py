@@ -3,6 +3,7 @@ import pandas as pd
 from ortools.sat.python import cp_model
 import io
 import datetime
+from openpyxl.styles import PatternFill
 
 st.set_page_config(page_title="Dialyse Dienstplan", layout="wide")
 st.title("🏥 Dienstplan-Generator: Dialyse (Diagnose-Modus)")
@@ -32,7 +33,8 @@ if uploaded_file is not None:
                 mitarbeiter_liste = df_haupt['Name'].tolist()
                 tage = [col for col in df_haupt.columns if col not in ['Name', 'Stundenausmaß', 'Berechnung Soll-Arbeitszeit', 'Übertrag Vormonat']]
                 num_tage = len(tage)
-                schichten = ['D1', 'V1', 'SL', 'D7', 'Frei', 'U', 'ZB', 'ÜZA', 'BA', 'Fobi']
+                # ANPASSUNG: Fobi wurde zu FB
+                schichten = ['D1', 'V1', 'SL', 'D7', 'Frei', 'U', 'ZB', 'ÜZA', 'BA', 'FB']
                 
                 dienst_vars = {}
                 for m in mitarbeiter_liste:
@@ -67,7 +69,7 @@ if uploaded_file is not None:
                 for index, row in df_haupt.iterrows():
                     m = row['Name']
                     for t_idx, tag in enumerate(tage):
-                        if wochentage_idx[t_idx] == 6: # Sonntag ignorieren
+                        if wochentage_idx[t_idx] == 6: 
                             continue
                             
                         eintrag = str(row[tag]).strip()
@@ -128,7 +130,6 @@ if uploaded_file is not None:
                     m = row['Name']
                     if m not in mitarbeiter_liste: continue
                     
-                    # Fester freier Tag (unterstützt auch Kommas, analog zu fester Dienst)
                     freier_tag_str = str(row.get('Fester freier Tag', '')).strip()
                     if freier_tag_str:
                         feste_freie_tage = [t.strip() for t in freier_tag_str.split(',')]
@@ -140,7 +141,6 @@ if uploaded_file is not None:
                                         if (m, t_idx) not in feste_eintraege:
                                             model.Add(dienst_vars[(m, t_idx, 'Frei')] == 1)
 
-                    # NEU: Fester Tag Dienst (unterstützt Kommas)
                     fester_dienst_str = str(row.get('Fester Tag Dienst', '')).strip()
                     if fester_dienst_str:
                         feste_dienst_tage = [t.strip() for t in fester_dienst_str.split(',')]
@@ -149,7 +149,6 @@ if uploaded_file is not None:
                                 ziel_wt = wt_map[tag_name]
                                 for t_idx in range(num_tage):
                                     if wochentage_idx[t_idx] == ziel_wt:
-                                        # Wird nur angewandt, wenn Sie nicht manuell U, F, etc. eingetragen haben
                                         if (m, t_idx) not in feste_eintraege:
                                             model.Add(dienst_vars[(m, t_idx, 'D1')] == 1)
                                 
@@ -205,7 +204,7 @@ if uploaded_file is not None:
 
                 model.Minimize(sum(straf_variablen))
 
-                # --- 7. BERECHNUNG ---
+                # --- 7. BERECHNUNG & AUSGABE ---
                 solver = cp_model.CpSolver()
                 solver.parameters.max_time_in_seconds = 60.0 
                 status = solver.Solve(model)
@@ -237,20 +236,89 @@ if uploaded_file is not None:
                         st.success("🎉 Plan erfolgreich berechnet! Die Station ist an allen Tagen zu 100 % besetzt.")
 
                     ausgabe_df = df_haupt.copy()
+                    
+                    # Hilfsfunktion zum sicheren Auslesen von Zahlen (falls jemand Kommas statt Punkte in Excel nutzt)
+                    def parse_num(val):
+                        try:
+                            if pd.isna(val) or str(val).strip() == "Leer": return 0.0
+                            return float(str(val).replace(',', '.').replace('+', '').strip())
+                        except:
+                            return 0.0
+
+                    # Ergebnisse eintragen und Stunden berechnen
+                    plan_stunden_liste = []
+                    gesamt_stunden_liste = []
+
                     for index, row in df_haupt.iterrows():
                         m = row['Name']
+                        
+                        # Tageswert für Abwesenheiten ermitteln (Wochenarbeitszeit / 5)
+                        stundenausmass = parse_num(row.get('Stundenausmaß', 0))
+                        tageswert_abwesenheit = stundenausmass / 5.0
+                        
+                        plan_std_aktuell = 0.0
+                        
                         for t_idx, tag in enumerate(tage):
                             for s in schichten:
                                 if solver.Value(dienst_vars[(m, t_idx, s)]) == 1:
-                                    ausgabe_df.at[index, tag] = s if s != 'Frei' else 'F'
+                                    final_eintrag = s if s != 'Frei' else 'F'
+                                    ausgabe_df.at[index, tag] = final_eintrag
                                     
+                                    # Stunden summieren
+                                    if s == 'D1': plan_std_aktuell += 11.25
+                                    elif s == 'V1': plan_std_aktuell += 7.0
+                                    elif s == 'SL': plan_std_aktuell += 9.0
+                                    elif s == 'D7': plan_std_aktuell += 8.25
+                                    elif s in ['U', 'ZB', 'ÜZA', 'BA', 'FB']: plan_std_aktuell += tageswert_abwesenheit
+                        
+                        plan_stunden_liste.append(plan_std_aktuell)
+                        uebertrag = parse_num(row.get('Übertrag Vormonat', 0))
+                        gesamt_stunden_liste.append(plan_std_aktuell + uebertrag)
+
+                    # Neue Spalten an der richtigen Stelle einfügen
+                    if 'Übertrag Vormonat' in ausgabe_df.columns:
+                        col_idx = ausgabe_df.columns.get_loc('Übertrag Vormonat') + 1
+                    else:
+                        col_idx = 3 # Fallback
+                        
+                    ausgabe_df.insert(col_idx, 'Plan-Stunden', plan_stunden_liste)
+                    ausgabe_df.insert(col_idx + 1, 'Stunden Gesamt', gesamt_stunden_liste)
+
                     st.dataframe(ausgabe_df.head(10))
                     
+                    # --- EXCEL EXPORT MIT FARBLICHER FORMATIERUNG ---
                     buffer = io.BytesIO()
                     with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-                        ausgabe_df.to_excel(writer, index=False)
-                    
-                    st.download_button(label="📥 Fertigen Dienstplan herunterladen", data=buffer.getvalue(), file_name="Dienstplan_Fertig.xlsx")
+                        ausgabe_df.to_excel(writer, index=False, sheet_name="Dienstplan")
+                        
+                        workbook = writer.book
+                        worksheet = writer.sheets['Dienstplan']
+                        
+                        # Farben definieren
+                        fill_d1 = PatternFill(start_color="40E0D0", end_color="40E0D0", fill_type="solid") # Türkis
+                        fill_v1 = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid") # Gelb
+                        fill_gruen = PatternFill(start_color="90EE90", end_color="90EE90", fill_type="solid") # Grün für U, ZB, ÜZA
+                        fill_rot = PatternFill(start_color="FF7F7F", end_color="FF7F7F", fill_type="solid") # Rot für F
+                        
+                        # Zellen durchgehen und einfärben
+                        for row in worksheet.iter_rows(min_row=2): # Kopfzeile überspringen
+                            for cell in row:
+                                val = str(cell.value).strip() if cell.value else ""
+                                if val == 'D1':
+                                    cell.fill = fill_d1
+                                elif val == 'V1':
+                                    cell.fill = fill_v1
+                                elif val in ['U', 'ZB', 'ÜZA']:
+                                    cell.fill = fill_gruen
+                                elif val == 'F':
+                                    cell.fill = fill_rot
+
+                    st.download_button(
+                        label="📥 Fertigen Dienstplan (inkl. Farben & Stunden) herunterladen", 
+                        data=buffer.getvalue(), 
+                        file_name="Dienstplan_Fertig_Farbig.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
                 else:
                     st.error("🚨 Kritischer Fehler! Die Mathematik widerspricht sich komplett.")
     except Exception as e:
