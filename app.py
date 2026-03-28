@@ -6,8 +6,8 @@ import datetime
 from openpyxl.styles import PatternFill
 
 st.set_page_config(page_title="Dialyse Dienstplan", layout="wide")
-st.title("🏥 Dienstplan-Generator: Dialyse (Diagnose-Modus)")
-st.markdown("Laden Sie Ihre Excel-Datei hoch. Die KI erstellt den Plan auch bei Unterbesetzung und zeigt Engpässe an.")
+st.title("🏥 Dienstplan-Generator: Dialyse (Stunden-Optimiert)")
+st.markdown("Laden Sie Ihre Excel-Datei hoch. Die KI erstellt den Plan, achtet strikt auf die +/- 25h Grenze und verteilt die Stunden fair.")
 
 uploaded_file = st.file_uploader("Excel-Tabelle hochladen (.xlsx)", type=["xlsx"])
 
@@ -26,14 +26,13 @@ if uploaded_file is not None:
         st.success("Tabelle und Sonderregeln erfolgreich eingelesen!")
         
         if st.button("Dienstplan jetzt berechnen"):
-            with st.spinner("Die KI jongliert nun mit dem Personal und sucht nach Engpässen..."):
+            with st.spinner("Die KI balanciert nun die Stundenkonten aus... Dies kann einen Moment dauern."):
                 
                 model = cp_model.CpModel()
                 
                 mitarbeiter_liste = df_haupt['Name'].tolist()
                 tage = [col for col in df_haupt.columns if col not in ['Name', 'Stundenausmaß', 'Berechnung Soll-Arbeitszeit', 'Übertrag Vormonat']]
                 num_tage = len(tage)
-                # ANPASSUNG: Fobi wurde zu FB
                 schichten = ['D1', 'V1', 'SL', 'D7', 'Frei', 'U', 'ZB', 'ÜZA', 'BA', 'FB']
                 
                 dienst_vars = {}
@@ -42,6 +41,23 @@ if uploaded_file is not None:
                         for s in schichten:
                             dienst_vars[(m, t_idx, s)] = model.NewBoolVar(f"{m}_{t_idx}_{s}")
                 
+                # --- 0. ZAHLEN SICHER EINLESEN ---
+                def parse_num(val):
+                    try:
+                        if pd.isna(val) or str(val).strip() == "Leer" or str(val).strip() == "": return 0.0
+                        return float(str(val).replace(',', '.').replace('+', '').strip())
+                    except:
+                        return 0.0
+
+                ma_daten = {}
+                for index, row in df_haupt.iterrows():
+                    m = row['Name']
+                    ma_daten[m] = {
+                        'ausmass_int': int(parse_num(row.get('Stundenausmaß', 0)) * 100),
+                        'soll_int': int(parse_num(row.get('Berechnung Soll-Arbeitszeit', 0)) * 100),
+                        'uebertrag_int': int(parse_num(row.get('Übertrag Vormonat', 0)) * 100)
+                    }
+
                 # --- 1. ROBUSTE WOCHENTAGS-ERKENNUNG ---
                 wochentage_idx = []
                 samstage_idx = []
@@ -80,7 +96,7 @@ if uploaded_file is not None:
                             elif eintrag in schichten:
                                 model.Add(dienst_vars[(m, t_idx, eintrag)] == 1)
 
-                # --- 3. DAS ÜBERDRUCK-VENTIL (Flexible Bedarfsplanung) ---
+                # --- 3. DAS ÜBERDRUCK-VENTIL ---
                 straf_variablen = []
                 fehlende_D1_vars = {}
                 fehlende_V1_vars = {}
@@ -94,14 +110,14 @@ if uploaded_file is not None:
                         
                     fehlend_d1 = model.NewIntVar(0, 7, f'fehlend_D1_{t_idx}')
                     fehlende_D1_vars[t_idx] = fehlend_d1
-                    straf_variablen.append(fehlend_d1 * 10000)
+                    straf_variablen.append(fehlend_d1 * 1000000) # Extrem hohe Strafe für fehlendes Personal
                     
                     if wt in [0, 1]: 
                         model.Add(sum(dienst_vars[(m, t_idx, 'D1')] for m in mitarbeiter_liste) + fehlend_d1 == 7)
                         
                         fehlend_v1 = model.NewIntVar(0, 1, f'fehlend_V1_{t_idx}')
                         fehlende_V1_vars[t_idx] = fehlend_v1
-                        straf_variablen.append(fehlend_v1 * 10000)
+                        straf_variablen.append(fehlend_v1 * 1000000)
                         model.Add(sum(dienst_vars[(m, t_idx, 'V1')] for m in mitarbeiter_liste) + fehlend_v1 == 1)
                     else: 
                         model.Add(sum(dienst_vars[(m, t_idx, 'D1')] for m in mitarbeiter_liste) + fehlend_d1 == 7)
@@ -121,7 +137,7 @@ if uploaded_file is not None:
                         model.Add(sum(dienst_vars[(m, t, 'D1')] for t in samstage_idx) <= 3) 
                         dritter_sat = model.NewBoolVar(f"DritterSat_{m}")
                         model.Add(sum(dienst_vars[(m, t, 'D1')] for t in samstage_idx) <= 2 + dritter_sat)
-                        straf_variablen.append(dritter_sat * 50) 
+                        straf_variablen.append(dritter_sat * 50000) 
 
                 # --- 5. INDIVIDUELLE REGELN ---
                 wt_map = {"Montag": 0, "Dienstag": 1, "Mittwoch": 2, "Donnerstag": 3, "Freitag": 4, "Samstag": 5, "Sonntag": 6}
@@ -184,14 +200,14 @@ if uploaded_file is not None:
                             is_iso = model.NewBoolVar(f"is_iso_bool_{m}_{t_idx}")
                             model.Add(val_iso == 1).OnlyEnforceIf(is_iso)
                             model.Add(val_iso != 1).OnlyEnforceIf(is_iso.Not())
-                            straf_variablen.append(is_iso * 15)
+                            straf_variablen.append(is_iso * 15000)
                             
                             val_3 = model.NewIntVar(0, 3, f"3blk_{m}_{t_idx}")
                             model.Add(val_3 == d_gestern + d_heute + d_morgen)
                             is_3blk = model.NewBoolVar(f"is_3blk_bool_{m}_{t_idx}")
                             model.Add(val_3 == 3).OnlyEnforceIf(is_3blk)
                             model.Add(val_3 != 3).OnlyEnforceIf(is_3blk.Not())
-                            straf_variablen.append(is_3blk * 10)
+                            straf_variablen.append(is_3blk * 10000)
 
                 # --- 6. WEICHE REGELN & OPTIMIERUNG ---
                 for m in mitarbeiter_liste:
@@ -200,13 +216,49 @@ if uploaded_file is not None:
                         sat2 = samstage_idx[i+1]
                         doppel_sat = model.NewBoolVar(f"DoppelSat_{m}_{sat1}")
                         model.Add(dienst_vars[(m, sat1, 'D1')] + dienst_vars[(m, sat2, 'D1')] == 2).OnlyEnforceIf(doppel_sat)
-                        straf_variablen.append(doppel_sat * 10) 
+                        straf_variablen.append(doppel_sat * 10000) 
 
+                # --- 7. NEU: STUNDENKONTO & FAIRNESS ---
+                for m in mitarbeiter_liste:
+                    ausmass_int = ma_daten[m]['ausmass_int']
+                    soll_int = ma_daten[m]['soll_int']
+                    uebertrag_int = ma_daten[m]['uebertrag_int']
+                    tageswert_int = int(ausmass_int / 5.0) if ausmass_int > 0 else 0
+                    
+                    schicht_dauer_liste = []
+                    for t_idx in range(num_tage):
+                        schicht_dauer_liste.append(dienst_vars[(m, t_idx, 'D1')] * 1125)
+                        schicht_dauer_liste.append(dienst_vars[(m, t_idx, 'V1')] * 700)
+                        schicht_dauer_liste.append(dienst_vars[(m, t_idx, 'SL')] * 900)
+                        schicht_dauer_liste.append(dienst_vars[(m, t_idx, 'D7')] * 825)
+                        for abw in ['U', 'ZB', 'ÜZA', 'BA', 'FB']:
+                            schicht_dauer_liste.append(dienst_vars[(m, t_idx, abw)] * tageswert_int)
+                            
+                    plan_std_var = model.NewIntVar(0, 50000, f'plan_std_{m}')
+                    model.Add(plan_std_var == sum(schicht_dauer_liste))
+                    
+                    # HARTE REGEL: +/- 25 Stunden Limit für die Planstunden
+                    if soll_int > 0: # Verhindert Fehler, wenn jemand 0 Sollstunden in Excel hat
+                        model.Add(plan_std_var >= soll_int - 2500)
+                        model.Add(plan_std_var <= soll_int + 2500)
+                    
+                    # FAIRNESS: Bestrafe die Abweichung vom perfekten Stundenkonto
+                    # Wir minimieren die Abweichung von Gesamtstunden zu Sollstunden
+                    diff_var = model.NewIntVar(-50000, 50000, f'diff_{m}')
+                    model.Add(diff_var == plan_std_var + uebertrag_int - soll_int)
+                    
+                    abs_diff = model.NewIntVar(0, 50000, f'abs_diff_{m}')
+                    model.AddAbsEquality(abs_diff, diff_var)
+                    
+                    # Hohe Strafe pro fehlender/überschüssiger Stunde (10 Punkte pro 0.01h Abweichung)
+                    straf_variablen.append(abs_diff * 10)
+
+                # KI soll alle Strafpunkte minimieren
                 model.Minimize(sum(straf_variablen))
 
-                # --- 7. BERECHNUNG & AUSGABE ---
+                # --- 8. BERECHNUNG & AUSGABE ---
                 solver = cp_model.CpSolver()
-                solver.parameters.max_time_in_seconds = 60.0 
+                solver.parameters.max_time_in_seconds = 90.0 # Der KI 90 Sekunden geben, da die Stundenberechnung schwer ist
                 status = solver.Solve(model)
 
                 if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
@@ -233,29 +285,17 @@ if uploaded_file is not None:
                         for w in warnungen:
                             st.write(w)
                     else:
-                        st.success("🎉 Plan erfolgreich berechnet! Die Station ist an allen Tagen zu 100 % besetzt.")
+                        st.success("🎉 Plan erfolgreich berechnet! Die Stunden sind gerecht verteilt.")
 
                     ausgabe_df = df_haupt.copy()
-                    
-                    # Hilfsfunktion zum sicheren Auslesen von Zahlen (falls jemand Kommas statt Punkte in Excel nutzt)
-                    def parse_num(val):
-                        try:
-                            if pd.isna(val) or str(val).strip() == "Leer": return 0.0
-                            return float(str(val).replace(',', '.').replace('+', '').strip())
-                        except:
-                            return 0.0
 
-                    # Ergebnisse eintragen und Stunden berechnen
                     plan_stunden_liste = []
                     gesamt_stunden_liste = []
 
                     for index, row in df_haupt.iterrows():
                         m = row['Name']
-                        
-                        # Tageswert für Abwesenheiten ermitteln (Wochenarbeitszeit / 5)
                         stundenausmass = parse_num(row.get('Stundenausmaß', 0))
                         tageswert_abwesenheit = stundenausmass / 5.0
-                        
                         plan_std_aktuell = 0.0
                         
                         for t_idx, tag in enumerate(tage):
@@ -264,29 +304,26 @@ if uploaded_file is not None:
                                     final_eintrag = s if s != 'Frei' else 'F'
                                     ausgabe_df.at[index, tag] = final_eintrag
                                     
-                                    # Stunden summieren
                                     if s == 'D1': plan_std_aktuell += 11.25
                                     elif s == 'V1': plan_std_aktuell += 7.0
                                     elif s == 'SL': plan_std_aktuell += 9.0
                                     elif s == 'D7': plan_std_aktuell += 8.25
                                     elif s in ['U', 'ZB', 'ÜZA', 'BA', 'FB']: plan_std_aktuell += tageswert_abwesenheit
                         
-                        plan_stunden_liste.append(plan_std_aktuell)
+                        plan_stunden_liste.append(round(plan_std_aktuell, 2))
                         uebertrag = parse_num(row.get('Übertrag Vormonat', 0))
-                        gesamt_stunden_liste.append(plan_std_aktuell + uebertrag)
+                        gesamt_stunden_liste.append(round(plan_std_aktuell + uebertrag, 2))
 
-                    # Neue Spalten an der richtigen Stelle einfügen
                     if 'Übertrag Vormonat' in ausgabe_df.columns:
                         col_idx = ausgabe_df.columns.get_loc('Übertrag Vormonat') + 1
                     else:
-                        col_idx = 3 # Fallback
+                        col_idx = 3 
                         
                     ausgabe_df.insert(col_idx, 'Plan-Stunden', plan_stunden_liste)
                     ausgabe_df.insert(col_idx + 1, 'Stunden Gesamt', gesamt_stunden_liste)
 
                     st.dataframe(ausgabe_df.head(10))
                     
-                    # --- EXCEL EXPORT MIT FARBLICHER FORMATIERUNG ---
                     buffer = io.BytesIO()
                     with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
                         ausgabe_df.to_excel(writer, index=False, sheet_name="Dienstplan")
@@ -294,32 +331,6 @@ if uploaded_file is not None:
                         workbook = writer.book
                         worksheet = writer.sheets['Dienstplan']
                         
-                        # Farben definieren
-                        fill_d1 = PatternFill(start_color="40E0D0", end_color="40E0D0", fill_type="solid") # Türkis
-                        fill_v1 = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid") # Gelb
-                        fill_gruen = PatternFill(start_color="90EE90", end_color="90EE90", fill_type="solid") # Grün für U, ZB, ÜZA
-                        fill_rot = PatternFill(start_color="FF7F7F", end_color="FF7F7F", fill_type="solid") # Rot für F
-                        
-                        # Zellen durchgehen und einfärben
-                        for row in worksheet.iter_rows(min_row=2): # Kopfzeile überspringen
-                            for cell in row:
-                                val = str(cell.value).strip() if cell.value else ""
-                                if val == 'D1':
-                                    cell.fill = fill_d1
-                                elif val == 'V1':
-                                    cell.fill = fill_v1
-                                elif val in ['U', 'ZB', 'ÜZA']:
-                                    cell.fill = fill_gruen
-                                elif val == 'F':
-                                    cell.fill = fill_rot
-
-                    st.download_button(
-                        label="📥 Fertigen Dienstplan (inkl. Farben & Stunden) herunterladen", 
-                        data=buffer.getvalue(), 
-                        file_name="Dienstplan_Fertig_Farbig.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
-                else:
-                    st.error("🚨 Kritischer Fehler! Die Mathematik widerspricht sich komplett.")
-    except Exception as e:
-        st.error(f"Ein Fehler ist aufgetreten: {e}")
+                        fill_d1 = PatternFill(start_color="40E0D0", end_color="40E0D0", fill_type="solid")
+                        fill_v1 = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+                        fill_gruen = PatternFill(start_color="90EE90", end_color="90EE90", fill
