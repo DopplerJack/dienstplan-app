@@ -124,7 +124,6 @@ if uploaded_file is not None:
                         model.Add(sum(dienst_vars[(m, t_idx, 'V1')] for m in mitarbeiter_liste) == 0)
 
                 # --- 4. FIXE GLOBALE REGELN ---
-                # Identifiziere alle Montage für die Wochen-Regel
                 mondays = [t for t, wt in enumerate(wochentage_idx) if wt == 0]
                 
                 for m in mitarbeiter_liste:
@@ -142,9 +141,8 @@ if uploaded_file is not None:
                         model.Add(sum(dienst_vars[(m, t, 'D1')] for t in samstage_idx) <= 2 + dritter_sat)
                         straf_variablen.append(dritter_sat * 50000) 
 
-                    # NEU: Zwingend 2 aufeinanderfolgende freie Tage pro Kalenderwoche (Mo-So)
                     for mo in mondays:
-                        if mo + 6 < num_tage: # Nur für vollständige Wochen im Monat anwenden
+                        if mo + 6 < num_tage: 
                             week_pairs = []
                             for i in range(6):
                                 t1 = mo + i
@@ -162,7 +160,6 @@ if uploaded_file is not None:
                                 
                                 week_pairs.append(pair_off)
                             
-                            # Es muss mindestens ein solches Paar in dieser Woche geben
                             model.AddBoolOr(week_pairs)
 
                 # --- 5. INDIVIDUELLE REGELN ---
@@ -235,14 +232,12 @@ if uploaded_file is not None:
                             model.Add(val_3 != 3).OnlyEnforceIf(is_3blk.Not())
                             straf_variablen.append(is_3blk * 10000)
 
-                    # NEU: Bevorzuge 3er D1-Blöcke
                     if str(row.get('Bevorzuge 3er D1-Blöcke', '')).strip().lower() == 'ja':
                         for t_idx in range(num_tage):
                             d_heute = dienst_vars[(m, t_idx, 'D1')]
                             d_gestern = dienst_vars[(m, t_idx-1, 'D1')] if t_idx > 0 else 0
                             d_morgen = dienst_vars[(m, t_idx+1, 'D1')] if t_idx < num_tage - 1 else 0
                             
-                            # Bestraft einzelne, isolierte Dienste
                             val_iso = model.NewIntVar(-2, 1, f"iso3_{m}_{t_idx}")
                             model.Add(val_iso == d_heute - d_gestern - d_morgen)
                             is_iso = model.NewBoolVar(f"is_iso3_bool_{m}_{t_idx}")
@@ -256,7 +251,6 @@ if uploaded_file is not None:
                             d_gestern = dienst_vars[(m, t_idx-1, 'D1')] if t_idx > 0 else 0
                             d_uebermorgen = dienst_vars[(m, t_idx+2, 'D1')] if t_idx < num_tage - 2 else 0
                             
-                            # Bestraft 2er-Blöcke
                             val_2blk = model.NewIntVar(-2, 2, f"2blk_{m}_{t_idx}")
                             model.Add(val_2blk == d_heute + d_morgen - d_gestern - d_uebermorgen)
                             is_2blk = model.NewBoolVar(f"is_2blk_bool_{m}_{t_idx}")
@@ -340,18 +334,28 @@ if uploaded_file is not None:
                     ausgabe_df = df_haupt.copy()
 
                     plan_stunden_liste = []
-                    gesamt_stunden_liste = []
+                    abweichung_liste = []
 
                     for index, row in df_haupt.iterrows():
                         m = row['Name']
                         stundenausmass = parse_num(row.get('Stundenausmaß', 0))
+                        soll_arbeitszeit = parse_num(row.get('Berechnung Soll-Arbeitszeit', 0))
                         tageswert_abwesenheit = stundenausmass / 5.0
                         plan_std_aktuell = 0.0
                         
                         for t_idx, tag in enumerate(tage):
                             for s in schichten:
                                 if solver.Value(dienst_vars[(m, t_idx, s)]) == 1:
-                                    final_eintrag = s if s != 'Frei' else 'F'
+                                    
+                                    # ANPASSUNG: Aktiver Wunsch = "F", Regulär Frei = "--"
+                                    if s == 'Frei':
+                                        if (m, t_idx) in feste_eintraege and feste_eintraege[(m, t_idx)] == 'F':
+                                            final_eintrag = 'F'
+                                        else:
+                                            final_eintrag = '--'
+                                    else:
+                                        final_eintrag = s
+                                        
                                     ausgabe_df.at[index, tag] = final_eintrag
                                     
                                     if s == 'D1': plan_std_aktuell += 11.25
@@ -361,8 +365,9 @@ if uploaded_file is not None:
                                     elif s in ['U', 'ZB', 'ÜZA', 'BA', 'FB']: plan_std_aktuell += tageswert_abwesenheit
                         
                         plan_stunden_liste.append(round(plan_std_aktuell, 2))
-                        uebertrag = parse_num(row.get('Übertrag Vormonat', 0))
-                        gesamt_stunden_liste.append(round(plan_std_aktuell + uebertrag, 2))
+                        
+                        # ANPASSUNG: Neue Spalte "Abweichung vom Soll" anstelle von "Stunden Gesamt"
+                        abweichung_liste.append(round(plan_std_aktuell - soll_arbeitszeit, 2))
 
                     if 'Übertrag Vormonat' in ausgabe_df.columns:
                         col_idx = ausgabe_df.columns.get_loc('Übertrag Vormonat') + 1
@@ -370,7 +375,7 @@ if uploaded_file is not None:
                         col_idx = 3 
                         
                     ausgabe_df.insert(col_idx, 'Plan-Stunden', plan_stunden_liste)
-                    ausgabe_df.insert(col_idx + 1, 'Stunden Gesamt', gesamt_stunden_liste)
+                    ausgabe_df.insert(col_idx + 1, 'Abweichung vom Soll', abweichung_liste)
 
                     st.dataframe(ausgabe_df.head(10))
                     
@@ -385,6 +390,7 @@ if uploaded_file is not None:
                         fill_v1 = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
                         fill_gruen = PatternFill(start_color="90EE90", end_color="90EE90", fill_type="solid")
                         fill_rot = PatternFill(start_color="FF7F7F", end_color="FF7F7F", fill_type="solid")
+                        fill_grau = PatternFill(start_color="D3D3D3", end_color="D3D3D3", fill_type="solid") # Hellgrau
                         
                         for row in worksheet.iter_rows(min_row=2): 
                             for cell in row:
@@ -397,6 +403,8 @@ if uploaded_file is not None:
                                     cell.fill = fill_gruen
                                 elif val == 'F':
                                     cell.fill = fill_rot
+                                elif val == '--':
+                                    cell.fill = fill_grau
 
                     st.download_button(
                         label="📥 Fertigen Dienstplan (inkl. Farben & Stunden) herunterladen", 
