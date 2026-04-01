@@ -75,6 +75,7 @@ if uploaded_file is not None:
                     if wt == 5: 
                         samstage_idx.append(t_idx)
 
+                # --- 2. GRUNDREGELN & EXCEL-INPUT ---
                 feste_eintraege = {} 
                 
                 for m in mitarbeiter_liste:
@@ -88,13 +89,23 @@ if uploaded_file is not None:
                             continue
                             
                         eintrag = str(row[tag]).strip()
-                        if eintrag != "Leer":
+                        if eintrag != "Leer" and eintrag != "":
                             feste_eintraege[(m, t_idx)] = eintrag 
                             if eintrag == "F": 
                                 model.Add(dienst_vars[(m, t_idx, 'Frei')] == 1)
                             elif eintrag in schichten:
                                 model.Add(dienst_vars[(m, t_idx, eintrag)] == 1)
 
+                # ANPASSUNG: Die KI darf diese Kürzel niemals selbst vergeben!
+                manuelle_kuerzel = ['SL', 'D7', 'U', 'ZB', 'ÜZA', 'BA', 'FB']
+                for m in mitarbeiter_liste:
+                    for t_idx in range(num_tage):
+                        for kuerzel in manuelle_kuerzel:
+                            # Wenn das Kürzel nicht explizit im Wunschplan stand, ist es für die KI verboten (0)
+                            if not ((m, t_idx) in feste_eintraege and feste_eintraege[(m, t_idx)] == kuerzel):
+                                model.Add(dienst_vars[(m, t_idx, kuerzel)] == 0)
+
+                # --- 3. DAS ÜBERDRUCK-VENTIL ---
                 straf_variablen = []
                 fehlende_D1_vars = {}
                 fehlende_V1_vars = {}
@@ -121,6 +132,7 @@ if uploaded_file is not None:
                         model.Add(sum(dienst_vars[(m, t_idx, 'D1')] for m in mitarbeiter_liste) + fehlend_d1 == 7)
                         model.Add(sum(dienst_vars[(m, t_idx, 'V1')] for m in mitarbeiter_liste) == 0)
 
+                # --- 4. FIXE GLOBALE REGELN ---
                 mondays = [t for t, wt in enumerate(wochentage_idx) if wt == 0]
                 
                 for m in mitarbeiter_liste:
@@ -159,6 +171,7 @@ if uploaded_file is not None:
                             
                             model.AddBoolOr(week_pairs)
 
+                # --- 5. INDIVIDUELLE REGELN ---
                 wt_map = {"Montag": 0, "Dienstag": 1, "Mittwoch": 2, "Donnerstag": 3, "Freitag": 4, "Samstag": 5, "Sonntag": 6}
                 
                 for index, row in df_regeln.iterrows():
@@ -194,12 +207,9 @@ if uploaded_file is not None:
                     if str(row.get('Immer ein V1-Dienst', '')).strip().lower() == 'ja':
                         model.Add(sum(dienst_vars[(m, t_idx, 'V1')] for t_idx in range(num_tage)) == 1)
                             
-                    # ANPASSUNG: Niemals 2 Dienste hintereinander (egal welche Schicht)
-                    if str(row.get('Niemals 2 Dienste hintereinander', '')).strip().lower() == 'ja':
+                    if str(row.get('Max 1 D1 am Stück', '')).strip().lower() == 'ja':
                         for t_idx in range(num_tage - 1):
-                            work_today = sum(dienst_vars[(m, t_idx, s)] for s in ['D1', 'V1', 'SL', 'D7'])
-                            work_tomorrow = sum(dienst_vars[(m, t_idx+1, s)] for s in ['D1', 'V1', 'SL', 'D7'])
-                            model.Add(work_today + work_tomorrow <= 1)
+                            model.Add(dienst_vars[(m, t_idx, 'D1')] + dienst_vars[(m, t_idx+1, 'D1')] <= 1)
 
                     if str(row.get('Freitag frei vor Samstag-D1', '')).strip().lower() == 'ja':
                         for t_idx in samstage_idx:
@@ -257,6 +267,7 @@ if uploaded_file is not None:
                             model.Add(val_2blk != 2).OnlyEnforceIf(is_2blk.Not())
                             straf_variablen.append(is_2blk * 10000)
 
+                # --- 6. WEICHE REGELN & OPTIMIERUNG ---
                 for m in mitarbeiter_liste:
                     for i in range(len(samstage_idx) - 1):
                         sat1 = samstage_idx[i]
@@ -265,6 +276,7 @@ if uploaded_file is not None:
                         model.Add(dienst_vars[(m, sat1, 'D1')] + dienst_vars[(m, sat2, 'D1')] == 2).OnlyEnforceIf(doppel_sat)
                         straf_variablen.append(doppel_sat * 10000) 
 
+                # --- 7. STUNDENKONTO & FAIRNESS ---
                 for m in mitarbeiter_liste:
                     ausmass_int = ma_daten[m]['ausmass_int']
                     soll_int = ma_daten[m]['soll_int']
