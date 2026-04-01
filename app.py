@@ -14,10 +14,12 @@ uploaded_file = st.file_uploader("Excel-Tabelle hochladen (.xlsx)", type=["xlsx"
 if uploaded_file is not None:
     try:
         df_haupt = pd.read_excel(uploaded_file, sheet_name=0)
+        df_haupt = df_haupt.astype(object) 
         df_haupt.fillna("Leer", inplace=True)
         
         try:
             df_regeln = pd.read_excel(uploaded_file, sheet_name=1)
+            df_regeln = df_regeln.astype(object)
             df_regeln.fillna("", inplace=True)
         except:
             st.error("Fehler: Konnte das zweite Tabellenblatt 'Sonderregeln' nicht finden. Bitte legen Sie es an.")
@@ -41,7 +43,6 @@ if uploaded_file is not None:
                         for s in schichten:
                             dienst_vars[(m, t_idx, s)] = model.NewBoolVar(f"{m}_{t_idx}_{s}")
                 
-                # --- 0. ZAHLEN SICHER EINLESEN ---
                 def parse_num(val):
                     try:
                         if pd.isna(val) or str(val).strip() == "Leer" or str(val).strip() == "": return 0.0
@@ -58,7 +59,6 @@ if uploaded_file is not None:
                         'uebertrag_int': int(parse_num(row.get('Übertrag Vormonat', 0)) * 100)
                     }
 
-                # --- 1. ROBUSTE WOCHENTAGS-ERKENNUNG ---
                 wochentage_idx = []
                 samstage_idx = []
                 for t_idx, tag_val in enumerate(tage):
@@ -75,7 +75,6 @@ if uploaded_file is not None:
                     if wt == 5: 
                         samstage_idx.append(t_idx)
 
-                # --- 2. GRUNDREGELN & EXCEL-INPUT ---
                 feste_eintraege = {} 
                 
                 for m in mitarbeiter_liste:
@@ -96,7 +95,6 @@ if uploaded_file is not None:
                             elif eintrag in schichten:
                                 model.Add(dienst_vars[(m, t_idx, eintrag)] == 1)
 
-                # --- 3. DAS ÜBERDRUCK-VENTIL ---
                 straf_variablen = []
                 fehlende_D1_vars = {}
                 fehlende_V1_vars = {}
@@ -123,7 +121,6 @@ if uploaded_file is not None:
                         model.Add(sum(dienst_vars[(m, t_idx, 'D1')] for m in mitarbeiter_liste) + fehlend_d1 == 7)
                         model.Add(sum(dienst_vars[(m, t_idx, 'V1')] for m in mitarbeiter_liste) == 0)
 
-                # --- 4. FIXE GLOBALE REGELN ---
                 mondays = [t for t, wt in enumerate(wochentage_idx) if wt == 0]
                 
                 for m in mitarbeiter_liste:
@@ -162,7 +159,6 @@ if uploaded_file is not None:
                             
                             model.AddBoolOr(week_pairs)
 
-                # --- 5. INDIVIDUELLE REGELN ---
                 wt_map = {"Montag": 0, "Dienstag": 1, "Mittwoch": 2, "Donnerstag": 3, "Freitag": 4, "Samstag": 5, "Sonntag": 6}
                 
                 for index, row in df_regeln.iterrows():
@@ -198,9 +194,12 @@ if uploaded_file is not None:
                     if str(row.get('Immer ein V1-Dienst', '')).strip().lower() == 'ja':
                         model.Add(sum(dienst_vars[(m, t_idx, 'V1')] for t_idx in range(num_tage)) == 1)
                             
-                    if str(row.get('Max 1 D1 am Stück', '')).strip().lower() == 'ja':
+                    # ANPASSUNG: Niemals 2 Dienste hintereinander (egal welche Schicht)
+                    if str(row.get('Niemals 2 Dienste hintereinander', '')).strip().lower() == 'ja':
                         for t_idx in range(num_tage - 1):
-                            model.Add(dienst_vars[(m, t_idx, 'D1')] + dienst_vars[(m, t_idx+1, 'D1')] <= 1)
+                            work_today = sum(dienst_vars[(m, t_idx, s)] for s in ['D1', 'V1', 'SL', 'D7'])
+                            work_tomorrow = sum(dienst_vars[(m, t_idx+1, s)] for s in ['D1', 'V1', 'SL', 'D7'])
+                            model.Add(work_today + work_tomorrow <= 1)
 
                     if str(row.get('Freitag frei vor Samstag-D1', '')).strip().lower() == 'ja':
                         for t_idx in samstage_idx:
@@ -258,7 +257,6 @@ if uploaded_file is not None:
                             model.Add(val_2blk != 2).OnlyEnforceIf(is_2blk.Not())
                             straf_variablen.append(is_2blk * 10000)
 
-                # --- 6. WEICHE REGELN & OPTIMIERUNG ---
                 for m in mitarbeiter_liste:
                     for i in range(len(samstage_idx) - 1):
                         sat1 = samstage_idx[i]
@@ -267,7 +265,6 @@ if uploaded_file is not None:
                         model.Add(dienst_vars[(m, sat1, 'D1')] + dienst_vars[(m, sat2, 'D1')] == 2).OnlyEnforceIf(doppel_sat)
                         straf_variablen.append(doppel_sat * 10000) 
 
-                # --- 7. STUNDENKONTO & FAIRNESS ---
                 for m in mitarbeiter_liste:
                     ausmass_int = ma_daten[m]['ausmass_int']
                     soll_int = ma_daten[m]['soll_int']
@@ -300,7 +297,6 @@ if uploaded_file is not None:
 
                 model.Minimize(sum(straf_variablen))
 
-                # --- 8. BERECHNUNG & AUSGABE ---
                 solver = cp_model.CpSolver()
                 solver.parameters.max_time_in_seconds = 90.0 
                 status = solver.Solve(model)
@@ -347,7 +343,6 @@ if uploaded_file is not None:
                             for s in schichten:
                                 if solver.Value(dienst_vars[(m, t_idx, s)]) == 1:
                                     
-                                    # ANPASSUNG: Aktiver Wunsch = "F", Regulär Frei = "--"
                                     if s == 'Frei':
                                         if (m, t_idx) in feste_eintraege and feste_eintraege[(m, t_idx)] == 'F':
                                             final_eintrag = 'F'
@@ -365,8 +360,6 @@ if uploaded_file is not None:
                                     elif s in ['U', 'ZB', 'ÜZA', 'BA', 'FB']: plan_std_aktuell += tageswert_abwesenheit
                         
                         plan_stunden_liste.append(round(plan_std_aktuell, 2))
-                        
-                        # ANPASSUNG: Neue Spalte "Abweichung vom Soll" anstelle von "Stunden Gesamt"
                         abweichung_liste.append(round(plan_std_aktuell - soll_arbeitszeit, 2))
 
                     if 'Übertrag Vormonat' in ausgabe_df.columns:
@@ -390,7 +383,7 @@ if uploaded_file is not None:
                         fill_v1 = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
                         fill_gruen = PatternFill(start_color="90EE90", end_color="90EE90", fill_type="solid")
                         fill_rot = PatternFill(start_color="FF7F7F", end_color="FF7F7F", fill_type="solid")
-                        fill_grau = PatternFill(start_color="D3D3D3", end_color="D3D3D3", fill_type="solid") # Hellgrau
+                        fill_grau = PatternFill(start_color="D3D3D3", end_color="D3D3D3", fill_type="solid")
                         
                         for row in worksheet.iter_rows(min_row=2): 
                             for cell in row:
